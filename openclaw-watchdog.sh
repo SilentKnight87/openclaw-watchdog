@@ -9,6 +9,7 @@ WATCHDOG_LOG_DIR="${WATCHDOG_LOG_DIR:-$HOME/clawd/logs}"
 WATCHDOG_LOG_FILE="${WATCHDOG_LOG_FILE:-$WATCHDOG_LOG_DIR/watchdog.log}"
 WATCHDOG_STATE_FILE="${WATCHDOG_STATE_FILE:-$WATCHDOG_LOG_DIR/watchdog.state}"
 WATCHDOG_LOCK_DIR="${WATCHDOG_LOCK_DIR:-$WATCHDOG_LOG_DIR/watchdog.lock}"
+WATCHDOG_LOCK_INFO_FILE="${WATCHDOG_LOCK_INFO_FILE:-$WATCHDOG_LOG_DIR/watchdog.lock.info}"
 WATCHDOG_CONFIG_FILE="${WATCHDOG_CONFIG_FILE:-$HOME/.openclaw/openclaw.json}"
 WATCHDOG_GATEWAY_PLIST="${WATCHDOG_GATEWAY_PLIST:-$HOME/Library/LaunchAgents/ai.openclaw.gateway.plist}"
 
@@ -24,13 +25,20 @@ WATCHDOG_DATE_BIN="${WATCHDOG_DATE_BIN:-date}"
 WATCHDOG_TAIL_BIN="${WATCHDOG_TAIL_BIN:-tail}"
 WATCHDOG_MKDIR_BIN="${WATCHDOG_MKDIR_BIN:-mkdir}"
 WATCHDOG_RMDIR_BIN="${WATCHDOG_RMDIR_BIN:-rmdir}"
+WATCHDOG_RM_BIN="${WATCHDOG_RM_BIN:-rm}"
+WATCHDOG_PERL_BIN="${WATCHDOG_PERL_BIN:-perl}"
+WATCHDOG_TIMEOUT_SHELL_BIN="${WATCHDOG_TIMEOUT_SHELL_BIN:-/bin/bash}"
 
 WATCHDOG_HEALTH_URL="${WATCHDOG_HEALTH_URL:-http://127.0.0.1:18789/health}"
 WATCHDOG_PORT="${WATCHDOG_PORT:-18789}"
-WATCHDOG_CHAT_ID="${WATCHDOG_CHAT_ID:-606404649}"
+WATCHDOG_CHAT_ID="${WATCHDOG_CHAT_ID:-}"
 WATCHDOG_ALERT_WINDOW_SECONDS="${WATCHDOG_ALERT_WINDOW_SECONDS:-600}"
 WATCHDOG_CHECK_WAIT_SECONDS="${WATCHDOG_CHECK_WAIT_SECONDS:-15}"
 WATCHDOG_MAX_LOG_LINES="${WATCHDOG_MAX_LOG_LINES:-1000}"
+WATCHDOG_RESTART_TIMEOUT_SECONDS="${WATCHDOG_RESTART_TIMEOUT_SECONDS:-30}"
+WATCHDOG_DOCTOR_TIMEOUT_SECONDS="${WATCHDOG_DOCTOR_TIMEOUT_SECONDS:-180}"
+WATCHDOG_NUCLEAR_TIMEOUT_SECONDS="${WATCHDOG_NUCLEAR_TIMEOUT_SECONDS:-30}"
+WATCHDOG_LOCK_STALE_SECONDS="${WATCHDOG_LOCK_STALE_SECONDS:-900}"
 
 WATCHDOG_STATE_LAST_HEALTHY=""
 WATCHDOG_STATE_LAST_ALERT_SENT=""
@@ -93,6 +101,17 @@ watchdog_duration_since() {
   else
     printf "%ds" "$seconds"
   fi
+}
+
+watchdog_quote_args() {
+  local quoted=""
+  local arg
+
+  for arg in "$@"; do
+    quoted="${quoted}$(printf '%q' "$arg") "
+  done
+
+  printf '%s' "${quoted% }"
 }
 
 watchdog_ensure_dirs() {
@@ -232,6 +251,11 @@ watchdog_send_telegram() {
   local message="$1"
   local token
 
+  if [ -z "$WATCHDOG_CHAT_ID" ]; then
+    watchdog_log "ERROR" "WATCHDOG_CHAT_ID is not configured; cannot send alert"
+    return 1
+  fi
+
   token="$(watchdog_extract_token)"
   if [ -z "$token" ]; then
     watchdog_log "ERROR" "Telegram token unavailable; cannot send alert"
@@ -267,24 +291,91 @@ watchdog_secondary_health_check() {
 
 watchdog_gateway_healthy() {
   if watchdog_primary_health_check; then
+    WATCHDOG_LAST_ERROR=""
     return 0
   fi
 
   if watchdog_secondary_health_check; then
-    return 0
+    WATCHDOG_LAST_ERROR="health endpoint failed while port ${WATCHDOG_PORT} is still listening"
+  else
+    WATCHDOG_LAST_ERROR="health endpoint failed and nothing is listening on port ${WATCHDOG_PORT}"
   fi
 
   return 1
 }
 
+watchdog_run_with_timeout() {
+  local timeout_seconds="$1"
+  local command="$2"
+
+  if ! command -v "$WATCHDOG_PERL_BIN" >/dev/null 2>&1; then
+    WATCHDOG_LAST_ERROR="Perl is unavailable; cannot enforce watchdog timeout"
+    return 125
+  fi
+
+  "$WATCHDOG_PERL_BIN" -e '
+    use strict;
+    use warnings;
+    use POSIX qw(WNOHANG WIFEXITED WEXITSTATUS WIFSIGNALED WTERMSIG setsid);
+
+    my ($timeout, $shell, $command) = @ARGV;
+    my $pid = fork();
+    defined $pid or exit 125;
+
+    if ($pid == 0) {
+      setsid() or exit 125;
+      exec($shell, "-lc", $command);
+      exit 125;
+    }
+
+    my $status = 0;
+    my $deadline = time + $timeout;
+
+    while (1) {
+      my $result = waitpid($pid, WNOHANG);
+      if ($result == $pid) {
+        $status = $?;
+        last;
+      }
+
+      if (time >= $deadline) {
+        kill "TERM", -$pid;
+        select undef, undef, undef, 2;
+        kill "KILL", -$pid;
+        waitpid($pid, 0);
+        exit 124;
+      }
+
+      select undef, undef, undef, 0.2;
+    }
+
+    if (WIFEXITED($status)) {
+      exit WEXITSTATUS($status);
+    }
+
+    if (WIFSIGNALED($status)) {
+      exit 128 + WTERMSIG($status);
+    }
+
+    exit 125;
+  ' "$timeout_seconds" "$WATCHDOG_TIMEOUT_SHELL_BIN" "$command"
+}
+
 watchdog_run_step() {
   local method="$1"
-  shift
+  local timeout_seconds="$2"
+  local command="$3"
+  local status=0
 
-  if "$@"; then
-    watchdog_log "INFO" "Healing step started: $method"
-  else
-    WATCHDOG_LAST_ERROR="Command failed for ${method}"
+  watchdog_log "INFO" "Healing step started: $method"
+  watchdog_run_with_timeout "$timeout_seconds" "$command"
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    if [ "$status" -eq 124 ]; then
+      WATCHDOG_LAST_ERROR="Healing step timed out for ${method} after ${timeout_seconds}s"
+    else
+      WATCHDOG_LAST_ERROR="Healing step failed for ${method} with exit ${status}"
+    fi
     watchdog_log "WARN" "$WATCHDOG_LAST_ERROR"
   fi
 
@@ -303,34 +394,37 @@ watchdog_run_step() {
   return 1
 }
 
-watchdog_step_restart() {
-  "$WATCHDOG_OPENCLAW_BIN" gateway restart
+watchdog_step_restart_command() {
+  watchdog_quote_args "$WATCHDOG_OPENCLAW_BIN" gateway restart
 }
 
-watchdog_step_doctor() {
-  "$WATCHDOG_YES_BIN" | "$WATCHDOG_OPENCLAW_BIN" doctor --fix
+watchdog_step_doctor_command() {
+  printf '%s | %s' \
+    "$(watchdog_quote_args "$WATCHDOG_YES_BIN")" \
+    "$(watchdog_quote_args "$WATCHDOG_OPENCLAW_BIN" doctor --fix)"
 }
 
-watchdog_step_nuclear() {
+watchdog_step_nuclear_command() {
   local uid
   uid="$("$WATCHDOG_ID_BIN" -u)"
-  "$WATCHDOG_LAUNCHCTL_BIN" bootout "gui/${uid}" ai.openclaw.gateway >/dev/null 2>&1 || true
-  "$WATCHDOG_LAUNCHCTL_BIN" bootstrap "gui/${uid}" "$WATCHDOG_GATEWAY_PLIST"
+  printf '%s >/dev/null 2>&1 || true\n%s' \
+    "$(watchdog_quote_args "$WATCHDOG_LAUNCHCTL_BIN" bootout "gui/${uid}" ai.openclaw.gateway)" \
+    "$(watchdog_quote_args "$WATCHDOG_LAUNCHCTL_BIN" bootstrap "gui/${uid}" "$WATCHDOG_GATEWAY_PLIST")"
 }
 
 watchdog_attempt_heal() {
   WATCHDOG_STATE_STATUS="healing"
   watchdog_save_state
 
-  if watchdog_run_step "restart" watchdog_step_restart; then
+  if watchdog_run_step "restart" "$WATCHDOG_RESTART_TIMEOUT_SECONDS" "$(watchdog_step_restart_command)"; then
     return 0
   fi
 
-  if watchdog_run_step "doctor" watchdog_step_doctor; then
+  if watchdog_run_step "doctor" "$WATCHDOG_DOCTOR_TIMEOUT_SECONDS" "$(watchdog_step_doctor_command)"; then
     return 0
   fi
 
-  if watchdog_run_step "nuclear" watchdog_step_nuclear; then
+  if watchdog_run_step "nuclear" "$WATCHDOG_NUCLEAR_TIMEOUT_SECONDS" "$(watchdog_step_nuclear_command)"; then
     return 0
   fi
 
@@ -339,16 +433,82 @@ watchdog_attempt_heal() {
   return 1
 }
 
-watchdog_acquire_lock() {
-  if "$WATCHDOG_MKDIR_BIN" "$WATCHDOG_LOCK_DIR" 2>/dev/null; then
+watchdog_write_lock_info() {
+  cat > "$WATCHDOG_LOCK_INFO_FILE" <<EOF
+pid=$$
+started_at=$(watchdog_now_iso)
+EOF
+}
+
+watchdog_lock_owner_pid() {
+  if [ ! -f "$WATCHDOG_LOCK_INFO_FILE" ]; then
+    printf '\n'
     return 0
   fi
+
+  sed -n 's/^pid=//p' "$WATCHDOG_LOCK_INFO_FILE" | head -n 1
+}
+
+watchdog_lock_started_at() {
+  if [ ! -f "$WATCHDOG_LOCK_INFO_FILE" ]; then
+    printf '\n'
+    return 0
+  fi
+
+  sed -n 's/^started_at=//p' "$WATCHDOG_LOCK_INFO_FILE" | head -n 1
+}
+
+watchdog_clear_lock() {
+  "$WATCHDOG_RM_BIN" -f "$WATCHDOG_LOCK_INFO_FILE" >/dev/null 2>&1 || true
+  "$WATCHDOG_RMDIR_BIN" "$WATCHDOG_LOCK_DIR" >/dev/null 2>&1 || true
+}
+
+watchdog_lock_is_stale() {
+  local pid started_at started_epoch now_epoch
+
+  pid="$(watchdog_lock_owner_pid)"
+  started_at="$(watchdog_lock_started_at)"
+
+  case "$pid" in
+    ''|*[!0-9]*)
+      return 0
+      ;;
+  esac
+
+  if ! kill -0 "$pid" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  started_epoch="$(watchdog_epoch "$started_at")"
+  now_epoch="$(watchdog_epoch "$(watchdog_now_iso)")"
+  if [ -z "$started_epoch" ] || [ -z "$now_epoch" ]; then
+    return 1
+  fi
+
+  [ $((now_epoch - started_epoch)) -ge "$WATCHDOG_LOCK_STALE_SECONDS" ]
+}
+
+watchdog_acquire_lock() {
+  if "$WATCHDOG_MKDIR_BIN" "$WATCHDOG_LOCK_DIR" 2>/dev/null; then
+    watchdog_write_lock_info
+    return 0
+  fi
+
+  if watchdog_lock_is_stale; then
+    watchdog_log "WARN" "Removing stale watchdog lock"
+    watchdog_clear_lock
+    if "$WATCHDOG_MKDIR_BIN" "$WATCHDOG_LOCK_DIR" 2>/dev/null; then
+      watchdog_write_lock_info
+      return 0
+    fi
+  fi
+
   watchdog_log "INFO" "Another watchdog run is already in progress"
   return 1
 }
 
 watchdog_release_lock() {
-  "$WATCHDOG_RMDIR_BIN" "$WATCHDOG_LOCK_DIR" >/dev/null 2>&1 || true
+  watchdog_clear_lock
 }
 
 watchdog_handle_healthy() {
@@ -390,6 +550,8 @@ watchdog_handle_failure() {
 }
 
 watchdog_main() {
+  local previous_status exit_code
+
   watchdog_ensure_dirs || {
     printf 'Failed to create log directory: %s\n' "$WATCHDOG_LOG_DIR" >&2
     return 1
@@ -402,16 +564,20 @@ watchdog_main() {
   fi
   trap watchdog_release_lock EXIT INT TERM
 
-  local previous_status
   previous_status="$WATCHDOG_STATE_STATUS"
+  exit_code=0
 
   if watchdog_gateway_healthy; then
     watchdog_handle_healthy "$previous_status"
-    return 0
+    exit_code=$?
+  else
+    watchdog_handle_failure "$previous_status"
+    exit_code=$?
   fi
 
-  watchdog_handle_failure "$previous_status"
-  return 0
+  watchdog_release_lock
+  trap - EXIT INT TERM
+  return "$exit_code"
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then

@@ -27,6 +27,8 @@
   <dict>
     <key>PATH</key>
     <string>__WATCHDOG_PATH__</string>
+    <key>WATCHDOG_CHAT_ID</key>
+    <string>__WATCHDOG_CHAT_ID__</string>
   </dict>
 </dict>
 </plist>

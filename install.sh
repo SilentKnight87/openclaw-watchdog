@@ -9,6 +9,25 @@ LAUNCH_AGENTS_DIR="${LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
 PLIST_TARGET="${PLIST_TARGET:-$LAUNCH_AGENTS_DIR/ai.openclaw.watchdog.plist}"
 SOURCE_PLIST="${REPO_DIR}/ai.openclaw.watchdog.plist"
 
+require_chat_id() {
+  local stripped_chat_id
+
+  case "${WATCHDOG_CHAT_ID:-}" in
+    '' )
+      printf 'WATCHDOG_CHAT_ID is required. Example: WATCHDOG_CHAT_ID=123456789 ./install.sh\n' >&2
+      exit 1
+      ;;
+  esac
+
+  stripped_chat_id="${WATCHDOG_CHAT_ID#-}"
+  case "$stripped_chat_id" in
+    ''|*[!0-9]*)
+      printf 'WATCHDOG_CHAT_ID must be a Telegram chat ID such as 123456789 or -1001234567890.\n' >&2
+      exit 1
+      ;;
+  esac
+}
+
 ensure_path_env() {
   local node_bin path_value
 
@@ -29,15 +48,19 @@ ensure_path_env() {
 
 render_plist() {
   local path_value="$1"
+  local chat_id="$2"
   sed \
     -e "s|__WATCHDOG_SCRIPT__|${TARGET_ROOT}/openclaw-watchdog.sh|g" \
     -e "s|__WATCHDOG_STDOUT__|${LOG_DIR}/watchdog-launchd.log|g" \
     -e "s|__WATCHDOG_STDERR__|${LOG_DIR}/watchdog-launchd-err.log|g" \
     -e "s|__WATCHDOG_PATH__|${path_value}|g" \
+    -e "s|__WATCHDOG_CHAT_ID__|${chat_id}|g" \
     "$SOURCE_PLIST" > "$PLIST_TARGET"
 }
 
 main() {
+  require_chat_id
+
   if [ -e "$TARGET_ROOT/openclaw-watchdog.sh" ] || [ -e "$PLIST_TARGET" ]; then
     if [ "${FORCE:-0}" != "1" ]; then
       printf 'Existing watchdog installation detected. Refusing to clobber without FORCE=1.\n' >&2
@@ -53,7 +76,7 @@ main() {
   cp "$REPO_DIR/README.md" "$TARGET_ROOT/README.md"
   chmod 755 "$TARGET_ROOT/openclaw-watchdog.sh" "$TARGET_ROOT/install.sh" "$TARGET_ROOT/uninstall.sh"
 
-  render_plist "$(ensure_path_env)"
+  render_plist "$(ensure_path_env)" "$WATCHDOG_CHAT_ID"
 
   launchctl bootout "gui/$(id -u)" ai.openclaw.watchdog >/dev/null 2>&1 || true
   launchctl bootstrap "gui/$(id -u)" "$PLIST_TARGET"

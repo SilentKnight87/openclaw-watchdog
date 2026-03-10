@@ -26,6 +26,7 @@ setup_test_env() {
   export WATCHDOG_LOG_FILE="$WATCHDOG_LOG_DIR/watchdog.log"
   export WATCHDOG_STATE_FILE="$WATCHDOG_LOG_DIR/watchdog.state"
   export WATCHDOG_LOCK_DIR="$WATCHDOG_LOG_DIR/watchdog.lock"
+  export WATCHDOG_LOCK_INFO_FILE="$WATCHDOG_LOG_DIR/watchdog.lock.info"
   export WATCHDOG_CONFIG_FILE="$HOME/.openclaw/openclaw.json"
   export WATCHDOG_GATEWAY_PLIST="$TMP_ROOT/ai.openclaw.gateway.plist"
   export WATCHDOG_CURL_BIN="$TMP_ROOT/bin/curl"
@@ -37,14 +38,23 @@ setup_test_env() {
   export WATCHDOG_SLEEP_BIN="$TMP_ROOT/bin/sleep"
   export WATCHDOG_DATE_BIN="$TMP_ROOT/bin/date"
   export WATCHDOG_JQ_BIN="jq"
+  export WATCHDOG_RM_BIN="rm"
+  export WATCHDOG_PERL_BIN="perl"
+  export WATCHDOG_TIMEOUT_SHELL_BIN="/bin/bash"
+  export WATCHDOG_CHAT_ID="123456789"
   export WATCHDOG_ALERT_WINDOW_SECONDS=600
   export WATCHDOG_CHECK_WAIT_SECONDS=0
   export WATCHDOG_MAX_LOG_LINES=1000
+  export WATCHDOG_RESTART_TIMEOUT_SECONDS=30
+  export WATCHDOG_DOCTOR_TIMEOUT_SECONDS=180
+  export WATCHDOG_NUCLEAR_TIMEOUT_SECONDS=30
+  export WATCHDOG_LOCK_STALE_SECONDS=900
   export MOCK_HEALTH_STATE_FILE="$TMP_ROOT/mock-health"
   export MOCK_OPENCLAW_LOG="$TMP_ROOT/openclaw-calls.log"
   export MOCK_TELEGRAM_LOG="$TMP_ROOT/telegram.log"
   export MOCK_LAUNCHCTL_LOG="$TMP_ROOT/launchctl.log"
   export MOCK_LSOF_STATE="$TMP_ROOT/lsof-state"
+  export MOCK_RESTART_BEHAVIOR="$TMP_ROOT/restart-behavior"
 
   cat > "$WATCHDOG_CONFIG_FILE" <<EOF
 {
@@ -88,6 +98,10 @@ set -eu
 printf '%s\n' "$*" >> "$MOCK_OPENCLAW_LOG"
 if [ "$1" = "gateway" ] && [ "$2" = "restart" ]; then
   mode="$(cat "${TMP_ROOT}/heal-on" 2>/dev/null || printf 'never')"
+  behavior="$(cat "$MOCK_RESTART_BEHAVIOR" 2>/dev/null || printf 'normal')"
+  if [ "$behavior" = "timeout" ]; then
+    sleep 5
+  fi
   if [ "$mode" = "restart" ]; then
     printf 'up' > "$MOCK_HEALTH_STATE_FILE"
   fi
@@ -162,6 +176,7 @@ EOF
 
   printf 'down' > "$MOCK_HEALTH_STATE_FILE"
   printf 'down' > "$MOCK_LSOF_STATE"
+  printf 'normal' > "$MOCK_RESTART_BEHAVIOR"
   : > "$MOCK_OPENCLAW_LOG"
   : > "$MOCK_TELEGRAM_LOG"
   : > "$MOCK_LAUNCHCTL_LOG"
@@ -186,7 +201,10 @@ test_health_detection() {
   watchdog_gateway_healthy || fail "primary health check should succeed"
   printf 'down' > "$MOCK_HEALTH_STATE_FILE"
   printf 'up' > "$MOCK_LSOF_STATE"
-  watchdog_gateway_healthy || fail "secondary health check should succeed"
+  if watchdog_gateway_healthy; then
+    fail "open port alone should not count as healthy"
+  fi
+  [ "$WATCHDOG_LAST_ERROR" = "health endpoint failed while port 18789 is still listening" ] || fail "port-only failure should explain why health failed"
   printf 'down' > "$MOCK_LSOF_STATE"
   if watchdog_gateway_healthy; then
     fail "gateway should be down when both checks fail"
@@ -221,6 +239,15 @@ test_telegram_format_and_rate_limit() {
   grep -q 'text=second' "$MOCK_TELEGRAM_LOG" || fail "alert payload should include message text"
 }
 
+test_missing_chat_id_is_logged() {
+  WATCHDOG_CHAT_ID=""
+  watchdog_send_telegram "first" || true
+  grep -q 'WATCHDOG_CHAT_ID is not configured' "$WATCHDOG_LOG_FILE" || fail "missing chat id should be logged"
+  if [ -s "$MOCK_TELEGRAM_LOG" ]; then
+    fail "telegram should not be called without a configured chat id"
+  fi
+}
+
 test_state_read_write() {
   WATCHDOG_STATE_LAST_HEALTHY="2026-03-09T18:30:00Z"
   WATCHDOG_STATE_LAST_ALERT_SENT="2026-03-09T18:40:00Z"
@@ -234,6 +261,30 @@ test_state_read_write() {
   [ "$WATCHDOG_STATE_CONSECUTIVE_FAILURES" = "3" ] || fail "failure count should persist"
   [ "$WATCHDOG_STATE_LAST_HEAL_METHOD" = "restart" ] || fail "heal method should persist"
   [ "$WATCHDOG_STATE_STATUS" = "healing" ] || fail "status should persist"
+}
+
+test_stale_lock_recovery() {
+  mkdir -p "$WATCHDOG_LOCK_DIR"
+  cat > "$WATCHDOG_LOCK_INFO_FILE" <<EOF
+pid=999999
+started_at=2026-03-09T18:30:00Z
+EOF
+  printf 'up' > "$MOCK_HEALTH_STATE_FILE"
+  watchdog_main
+  grep -q 'Removing stale watchdog lock' "$WATCHDOG_LOG_FILE" || fail "stale lock should be reclaimed"
+  grep -q 'Gateway healthy' "$WATCHDOG_LOG_FILE" || fail "watchdog should continue after clearing stale lock"
+  [ ! -d "$WATCHDOG_LOCK_DIR" ] || fail "lock directory should be cleaned up on exit"
+}
+
+test_restart_timeout_falls_through_to_doctor() {
+  printf 'doctor' > "$TMP_ROOT/heal-on"
+  printf 'timeout' > "$MOCK_RESTART_BEHAVIOR"
+  WATCHDOG_RESTART_TIMEOUT_SECONDS=1
+  watchdog_load_state
+  watchdog_handle_failure "healthy"
+  grep -q 'Healing step timed out for restart after 1s' "$WATCHDOG_LOG_FILE" || fail "restart timeout should be logged"
+  grep -q '^doctor --fix$' "$MOCK_OPENCLAW_LOG" || fail "doctor should run after a timed out restart"
+  grep -q 'Method: doctor' "$MOCK_TELEGRAM_LOG" || fail "doctor recovery should still alert"
 }
 
 test_log_rotation() {
@@ -284,7 +335,10 @@ EOF
 run_test "health detection" test_health_detection
 run_test "healing ladder" test_healing_ladder_stops_on_success
 run_test "telegram rate limiting" test_telegram_format_and_rate_limit
+run_test "missing chat id" test_missing_chat_id_is_logged
 run_test "state read write" test_state_read_write
+run_test "stale lock recovery" test_stale_lock_recovery
+run_test "restart timeout fallback" test_restart_timeout_falls_through_to_doctor
 run_test "log rotation" test_log_rotation
 run_test "healthy fast path" test_fast_path_healthy
 run_test "edge cases" test_missing_or_corrupt_state_config_and_no_network
